@@ -3,9 +3,13 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 import json
+import re
 
 # --- CONFIGURAZIONE PAGINA ---
-st.set_page_config(page_title="AI Kitchen Multi-Agent Pro", layout="wide", page_icon="👨‍🍳")
+st.set_page_config(page_title="AI Kitchen Pro - Token Monitor", layout="wide", page_icon="👨‍🍳")
+
+# --- COSTANTI DI LIMITAZIONE ---
+MAX_SESSION_TOKENS = 30000  # Soglia massima per evitare blocchi nel piano free
 
 # 1. INIZIALIZZAZIONE STATO
 if "chat_history" not in st.session_state:
@@ -17,31 +21,33 @@ if "preferenze" not in st.session_state:
 if "num_persone" not in st.session_state:
     st.session_state.num_persone = "Non specificato"
 if "ultimo_giudizio" not in st.session_state:
-    st.session_state.ultimo_giudizio = "In attesa di una proposta dello Chef..."
+    st.session_state.ultimo_giudizio = "In attesa..."
+if "total_tokens" not in st.session_state:
+    st.session_state.total_tokens = 0
 
-# --- AGENTE 1: ESTRAZIONE DATI (Entity Extraction) ---
+# --- FUNZIONE ESTRAZIONE DATI CON MONITORAGGIO TOKEN ---
 def update_kitchen_state(text, api_key):
-    llm = ChatGroq(model_name="llama-3.3-70b-versatile", groq_api_key=api_key)
-    extract_prompt = ChatPromptTemplate.from_template("""
-    Analizza il messaggio dell'utente per aggiornare lo stato della cucina.
-    REGOLE: 
-    - Converti numeri in lettere in cifre (es: due -> 2, mezzo chilo -> 0.5 kg).
-    - Estrai ingredienti, quantita', scadenze, persone e vincoli (celiaco, vegano).
-    
-    Rispondi SOLO con JSON:
-    {{
-        "ingredients": [{{ "item": "nome", "qty": "quantita", "expiry": "scadenza o null" }}],
-        "preferences": ["stringa"],
-        "people": "numero o null"
-    }}
-    Messaggio: {input}
-    """)
-    chain = extract_prompt | llm
     try:
+        llm = ChatGroq(model_name="llama-3.3-70b-versatile", groq_api_key=api_key)
+        extract_prompt = ChatPromptTemplate.from_template("""
+        Estrai dati dal messaggio per la cucina. 
+        Rispondi SOLO con JSON:
+        {{
+            "ingredients": [{{ "item": "nome", "qty": "quantita", "expiry": "scadenza o null" }}],
+            "preferences": ["stringa"],
+            "people": "numero o null"
+        }}
+        Messaggio: {input}
+        """)
+        chain = extract_prompt | llm
         response = chain.invoke({"input": text})
-        json_clean = response.content.strip().replace('```json', '').replace('```', '')
-        data = json.loads(json_clean)
         
+        # Monitoraggio Token (Pag. 255)
+        if hasattr(response, 'response_metadata'):
+            usage = response.response_metadata.get('token_usage', {})
+            st.session_state.total_tokens += usage.get('total_tokens', 0)
+
+        data = json.loads(response.content.strip().replace('```json', '').replace('```', ''))
         if data.get("people"): st.session_state.num_persone = str(data["people"])
         for new_ing in data.get("ingredients", []):
             nome = new_ing['item'].lower().strip()
@@ -56,56 +62,63 @@ def update_kitchen_state(text, api_key):
         for p in data.get("preferences", []):
             if p.lower() not in [x.lower() for x in st.session_state.preferenze]:
                 st.session_state.preferenze.append(p)
-    except: pass
+    except Exception as e:
+        print(f"Errore estrazione: {e}")
 
-# --- SIDEBAR (SINISTRA): STATO DISPENSA ---
+# --- SIDEBAR (MONITORAGGIO TOKEN E STATO) ---
 with st.sidebar:
-    st.header("🛒 Inventario & Vincoli")
-    st.info(f"👥 **Commensali:** {st.session_state.num_persone}")
+    st.header("📊 Monitor Risorse")
     
-    st.subheader("📦 Dispensa")
-    if not st.session_state.dispensa:
-        st.write("In attesa di dati...")
-    else:
-        for ing in st.session_state.dispensa:
-            scad = ing['expiry'] if (ing['expiry'] and ing['expiry'] != 'null') else "N/D"
-            st.success(f"**{ing['item']}**\n{ing['qty']} | Scad: {scad}")
+    # Visualizzazione Token
+    token_perc = min(st.session_state.total_tokens / MAX_SESSION_TOKENS, 1.0)
+    st.write(f"Token utilizzati: **{st.session_state.total_tokens}** / {MAX_SESSION_TOKENS}")
+    st.progress(token_perc)
     
-    st.subheader("🚫 Vincoli Dietetici")
+    if st.session_state.total_tokens > MAX_SESSION_TOKENS * 0.9:
+        st.warning("⚠️ Attenzione: sei vicino al limite token della sessione.")
+
+    st.divider()
+    st.header("🛒 Stato Cucina")
+    st.info(f"👥 Persone: {st.session_state.num_persone}")
+    
+    for ing in st.session_state.dispensa:
+        st.success(f"**{ing['item']}**\n{ing['qty']} | Scad: {ing['expiry']}")
+    
     for pref in st.session_state.preferenze:
         st.error(pref)
     
     st.divider()
     api_key = st.text_input("Groq API Key", type="password")
-    if st.button("🔄 Reset Sessione"):
+    if st.button("🔄 Reset Totale"):
         st.session_state.clear()
         st.rerun()
 
-# --- LAYOUT PRINCIPALE: CHAT (CENTRO) E GIUDICE (DESTRA) ---
+# --- LAYOUT PRINCIPALE ---
 col_chat, col_judge = st.columns([0.7, 0.3])
 
 with col_chat:
-    st.title("👨‍🍳 AI Chef Advisor")
-    st.markdown("Analisi bilanciata delle porzioni e dei vincoli dietetici.")
-
-    # Visualizzazione Chat
+    st.title("👨‍🍳 AI Multi-Agent Kitchen")
     for message in st.session_state.chat_history:
         avatar = "👨‍🍳" if message["role"] == "assistant" else None
         with st.chat_message(message["role"], avatar=avatar):
             st.markdown(message["content"])
 
-    user_input = st.chat_input("Inserisci dati o chiedi ricette...")
+    # Disabilita input se token esauriti
+    if st.session_state.total_tokens < MAX_SESSION_TOKENS:
+        user_input = st.chat_input("Inserisci dati...")
+    else:
+        st.error("🛑 Limite token raggiunto per questa sessione. Reset dell'app necessario.")
+        user_input = None
 
 with col_judge:
-    st.header("⚖️ Verifica Giudice")
-    st.markdown("---")
+    st.header("⚖️ Giudice Critico")
     st.warning(st.session_state.ultimo_giudizio)
 
-# --- LOGICA INTERAZIONE ---
+# --- LOGICA CORE ---
 if user_input:
     with col_chat:
         if not api_key:
-            st.error("Inserisci l'API Key nella sidebar!")
+            st.error("Inserisci l'API Key!")
         else:
             update_kitchen_state(user_input, api_key)
             st.chat_message("user").markdown(user_input)
@@ -113,59 +126,39 @@ if user_input:
 
             try:
                 llm = ChatGroq(model_name="llama-3.3-70b-versatile", groq_api_key=api_key)
-                
-                # Controllo soglia (Necessari dati minimi per procedere)
                 sufficiente = "SI" if (len(st.session_state.dispensa) >= 5 and st.session_state.num_persone != "Non specificato") else "NO"
                 
-                # --- AGENTE 2: CHEF (Generazione con focus sulle porzioni) ---
-                with st.spinner("Lo Chef sta calcolando le dosi..."):
+                # CHEF
+                with st.spinner("Chef al lavoro..."):
                     disp_txt = "\n".join([f"- {i['item']} ({i['qty']}, scad: {i['expiry']})" for i in st.session_state.dispensa])
                     chef_prompt = ChatPromptTemplate.from_messages([
-                        ("system", f"""Sei uno Chef esperto in nutrizione e gestione delle risorse.
-                        DATI: Dispensa: {disp_txt} | Vincoli: {st.session_state.preferenze} | Persone: {st.session_state.num_persone}.
-                        
-                        REGOLE FONDAMENTALI:
-                        1. Se SOGLIA={sufficiente} è NO: Chiedi dati mancanti (persone, scadenze, ecc.).
-                        2. Se SOGLIA=SI: Proponi ESATTAMENTE 3 RICETTE COMPLETE.
-                           - IMPORTANTE: Calcola DOSI REALISTICHE per {st.session_state.num_persone} persone. Non esagerare (es. non usare 1kg di verdure se ne bastano 400g).
-                           - Specifica le quantita' esatte da usare per ogni ingrediente nella ricetta.
-                           - Fornisci uno SVOLGIMENTO DETTAGLIATO per ogni piatto.
-                        3. Rispetta rigorosamente Celiaci (No Glutine) e Vegani (No Animali).
-                        4. Dai priorita' assoluta agli ingredienti in scadenza imminente.
-                        5. Rispondi in italiano."""),
+                        ("system", f"Sei uno Chef. Dati: {disp_txt} | Persone: {st.session_state.num_persone}. REGOLE: Se SOGLIA={sufficiente} e' SI, dai 3 ricette complete con dosi reali e svolgimento. Rispetta vincoli: {st.session_state.preferenze}. Rispondi in italiano."),
                         MessagesPlaceholder(variable_name="history"),
                         ("human", "{input}")
                     ])
                     history_lc = [HumanMessage(content=m["content"]) if m["role"]=="user" else AIMessage(content=m["content"]) for m in st.session_state.chat_history[:-1]]
                     chef_res = (chef_prompt | llm).invoke({"input": user_input, "history": history_lc})
+                    
+                    # Track Tokens
+                    st.session_state.total_tokens += chef_res.response_metadata.get('token_usage', {}).get('total_tokens', 0)
 
-                # --- AGENTE 3: GIUDICE (Riflessione critica sulle porzioni) ---
+                # GIUDICE
                 if sufficiente == "SI":
-                    with st.spinner("Il Giudice sta verificando le porzioni..."):
-                        judge_prompt = ChatPromptTemplate.from_template("""
-                        Sei un Giudice Gastronomico rigoroso. Valuta le 3 ricette dello Chef.
-                        Persone: {persone}, Vincoli: {vincoli}.
-                        
-                        RICETTE DA ANALIZZARE:
-                        {ricette}
-                        
-                        CRITERI DI VALUTAZIONE:
-                        1. DOSI: Le quantita' suggerite sono corrette per {persone} persone o sono eccessive/insufficienti?
-                        2. SICUREZZA: Sono stati usati ingredienti vietati (Glutine/Animali)?
-                        3. SCADENZE: Lo Chef ha dato priorita' ai prodotti vicini alla scadenza?
-                        
-                        Fornisci un voto da 1 a 10 e un giudizio tecnico sintetico focalizzato sull'equilibrio delle porzioni.
-                        """)
+                    with st.spinner("Giudice al lavoro..."):
+                        judge_prompt = ChatPromptTemplate.from_template("Sei un Giudice Gastronomico. Valuta le dosi per {persone} persone e la sicurezza (vincoli: {vincoli}) delle ricette: {ricette}. Voto 1-10 e critica breve.")
                         judge_res = (judge_prompt | llm).invoke({
                             "persone": st.session_state.num_persone,
                             "vincoli": st.session_state.preferenze,
                             "ricette": chef_res.content
                         })
                         st.session_state.ultimo_giudizio = judge_res.content
+                        st.session_state.total_tokens += judge_res.response_metadata.get('token_usage', {}).get('total_tokens', 0)
 
-                # Salvataggio e aggiornamento UI
                 st.session_state.chat_history.append({"role": "assistant", "content": chef_res.content})
                 st.rerun()
 
             except Exception as e:
-                st.error(f"Errore tecnico: {e}")
+                if "429" in str(e):
+                    st.error("⏳ Limite di velocità raggiunto (Rate Limit). Attendi 60 secondi prima di riprovare.")
+                else:
+                    st.error(f"⚠️ Errore di connessione o token: {e}")
